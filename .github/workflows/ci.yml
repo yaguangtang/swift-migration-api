@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Build binary
+        run: go build -v -o ./bin/swift-migration-api ./cmd/swift-migration-api

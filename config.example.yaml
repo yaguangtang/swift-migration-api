@@ -1,0 +1,42 @@
+server:
+  listen: ":8443"
+  read_timeout: 60s
+  write_timeout: 0s
+  tls:
+    enabled: false
+    cert_file: ""
+    key_file: ""
+
+backends:
+  ceph:
+    base_url: "https://rgw.example.com/swift/v1"
+    timeout: 120s
+  swift:
+    base_url: "https://swift.example.com/v1"
+    timeout: 120s
+
+auth:
+  forward_headers:
+    - X-Auth-Token
+    - Authorization
+  worker_keystone:
+    auth_url: "https://keystone.example.com/v3"
+    application_credential_id: "replace-me"
+    application_credential_secret: "replace-me"
+    region: "RegionOne"
+    interface: "public"
+
+migration:
+  mode: "lazy_queue"
+  queue_store: "./jobs.sqlite"
+  worker_concurrency: 4
+  copy_on_head_miss: true
+  scan_on_container_list: true
+  verify_etag: true
+  delete_source_after_copy: false
+  poll_interval: 2s
+  retry_base: 2s
+  max_attempts: 5
+
+admin:
+  auth_token: "replace-me"
