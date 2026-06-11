@@ -29,33 +29,31 @@ It gives clients a single Swift-compatible endpoint while data is being migrated
                      +----------+-----------+
                                 |
                                 v
-                 +----------------------------------+
-                 |      Swift Migration API         |
-                 |                                  |
-                 |  - Swift-compatible front end    |
-                 |  - Ceph-first request routing    |
-                 |  - 404 fallback to old Swift     |
-                 |  - Queue + immediate sync paths  |
-                 +-----------+--------------+-------+
-                             |              |
-                  read/write |              | fallback read
-                  first      |              | on exact 404
-                             v              v
-                  +----------------+   +-------------------+
-                  |   Ceph RGW     |   | Legacy Swift API  |
-                  |  Swift API     |   | OpenStack Swift   |
-                  +--------+-------+   +---------+---------+
-                           ^                     |
-                           |                     |
-                           +----------+----------+
-                                      |
-                                      | queued or immediate copy
-                                      | metadata + objects
-                                      v
-                            +----------------------+
-                            | Migration Workers    |
-                            | Queue + SQLite store |
-                            +----------------------+
+        +----------------------------------+     +----------------------+
+        |      Swift Migration API         |---->| Migration Workers    |
+        |                                  |     | Queue + SQLite store |
+        |  - Swift-compatible front end    |     | Background metadata  |
+        |  - Ceph-first request routing    |     | and object sync      |
+        |  - 404 fallback to old Swift     |     +----------------------+
+        |  - Queue + immediate sync paths  |
+        +-----------+-------+------+-------+
+                    |       |      |
+         read/write |       |      | fallback read
+         first      |       |      | on exact 404
+                    v       |      v
+         +----------------+ | +-------------------+
+         |   Ceph RGW     | | | Legacy Swift API  |
+         |  Swift API     | | | OpenStack Swift   |
+         +--------+-------+ | +---------+---------+
+                  |         |           |
+                  | auth    |           | auth
+                  +---------+-----------+
+                             |
+                             v
+                    +----------------------+
+                    |      Keystone        |
+                    |  Identity / Auth     |
+                    +----------------------+
 ```
 
 ## Request Flow
