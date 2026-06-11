@@ -22,6 +22,7 @@ type Migrator interface {
 	EnqueueContainerWithSourceAuth(ctx context.Context, account, container string, creds auth.Credentials) (store.Job, error)
 	EnsureContainerWithSourceAuth(ctx context.Context, account, container string, creds auth.Credentials) (bool, error)
 	CopyObjectNowWithSourceAuth(ctx context.Context, account, container, object string, creds auth.Credentials) error
+	SyncContainerNowWithSourceAuth(ctx context.Context, account, container string, creds auth.Credentials) error
 }
 
 type Handler struct {
@@ -31,6 +32,7 @@ type Handler struct {
 	headerForwarder     *auth.HeaderForwarder
 	copyOnHeadMiss      bool
 	scanOnContainerList bool
+	runAsync            func(func())
 	logger              *slog.Logger
 }
 
@@ -50,7 +52,10 @@ func NewHandler(
 		headerForwarder:     headerForwarder,
 		copyOnHeadMiss:      copyOnHeadMiss,
 		scanOnContainerList: scanOnContainerList,
-		logger:              logger,
+		runAsync: func(fn func()) {
+			go fn()
+		},
+		logger: logger,
 	}
 }
 
@@ -281,12 +286,28 @@ func (h *Handler) handleObjectRead(w http.ResponseWriter, r *http.Request, parse
 
 	if backend.IsSuccess(swiftResp.StatusCode) && (r.Method == http.MethodGet || h.copyOnHeadMiss) {
 		if sourceCreds.HasAuth() && sourceCreds.ExpiresAt == nil {
-			h.logger.Warn("skipping queued object migration because caller token expiry is unavailable", "account", parsed.Account, "container", parsed.Container, "object", parsed.Object)
+			h.logger.Info("starting immediate object migration because caller token expiry is unavailable", "account", parsed.Account, "container", parsed.Container, "object", parsed.Object)
+			h.copyObjectImmediately(r.Context(), parsed, sourceCreds)
 		} else if _, err := h.migrator.EnqueueObjectWithSourceAuth(r.Context(), parsed.Account, parsed.Container, parsed.Object, sourceCreds); err != nil {
 			h.logger.Error("failed to enqueue object migration", "account", parsed.Account, "container", parsed.Container, "object", parsed.Object, "error", err)
 		}
 	}
 	writeUpstreamResponse(w, swiftResp, r.Method == http.MethodHead)
+}
+
+func (h *Handler) copyObjectImmediately(parent context.Context, parsed SwiftPath, creds auth.Credentials) {
+	ctx := context.WithoutCancel(parent)
+	h.runAsync(func() {
+		if err := h.migrator.CopyObjectNowWithSourceAuth(ctx, parsed.Account, parsed.Container, parsed.Object, creds); err != nil {
+			if errors.Is(err, migration.ErrNotFound) {
+				h.logger.Warn("immediate object migration skipped because source object disappeared", "account", parsed.Account, "container", parsed.Container, "object", parsed.Object)
+				return
+			}
+			h.logger.Error("immediate object migration failed", "account", parsed.Account, "container", parsed.Container, "object", parsed.Object, "error", err)
+			return
+		}
+		h.logger.Info("immediate object migration completed", "account", parsed.Account, "container", parsed.Container, "object", parsed.Object)
+	})
 }
 
 func (h *Handler) ensureContainerIfNeeded(w http.ResponseWriter, r *http.Request, parsed SwiftPath) bool {
@@ -538,12 +559,24 @@ func (h *Handler) enqueueContainerScan(ctx context.Context, parsed SwiftPath, cr
 		return
 	}
 	if creds.HasAuth() && creds.ExpiresAt == nil {
-		h.logger.Warn("skipping queued container scan because caller token expiry is unavailable", "account", parsed.Account, "container", parsed.Container)
+		h.logger.Info("starting immediate container scan because caller token expiry is unavailable", "account", parsed.Account, "container", parsed.Container)
+		h.syncContainerImmediately(ctx, parsed, creds)
 		return
 	}
 	if _, err := h.migrator.EnqueueContainerWithSourceAuth(ctx, parsed.Account, parsed.Container, creds); err != nil {
 		h.logger.Error("failed to enqueue container scan", "account", parsed.Account, "container", parsed.Container, "error", err)
 	}
+}
+
+func (h *Handler) syncContainerImmediately(parent context.Context, parsed SwiftPath, creds auth.Credentials) {
+	ctx := context.WithoutCancel(parent)
+	h.runAsync(func() {
+		if err := h.migrator.SyncContainerNowWithSourceAuth(ctx, parsed.Account, parsed.Container, creds); err != nil {
+			h.logger.Error("immediate container scan failed", "account", parsed.Account, "container", parsed.Container, "error", err)
+			return
+		}
+		h.logger.Info("immediate container scan completed", "account", parsed.Account, "container", parsed.Container)
+	})
 }
 
 func (h *Handler) writeProxyError(w http.ResponseWriter, parsed SwiftPath, action string, err error) {

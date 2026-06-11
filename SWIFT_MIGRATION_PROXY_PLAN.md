@@ -124,6 +124,9 @@ For `GET /v1/{account}/{container}`:
 - Query both backends
 - Merge and de-duplicate object names
 - Prefer Ceph objects when duplicates exist
+- When Swift contributes objects to the merged response, trigger migration for that container
+- Enqueue the container migration job when trusted caller-token expiry metadata exists
+- Start immediate best-effort container sync with the caller token when caller auth exists but expiry metadata is unavailable
 
 ### Container Create and Metadata Update
 For `PUT` and `POST /v1/{account}/{container}`:
@@ -146,7 +149,8 @@ For `GET` and `HEAD /v1/{account}/{container}/{object...}`:
 - Try Ceph first
 - If Ceph returns `404`, read from Swift
 - If Swift returns the object successfully, stream it back immediately
-- Enqueue an asynchronous object migration job after successful fallback read
+- Enqueue an asynchronous object migration job after successful fallback read when trusted caller-token expiry metadata exists
+- Start immediate best-effort object migration with the caller token when caller auth exists but expiry metadata is unavailable
 
 ### Object Create or Replace
 For `PUT /v1/{account}/{container}/{object...}`:
@@ -170,13 +174,14 @@ For `DELETE /v1/{account}/{container}/{object...}`:
 ## Migration Policy
 
 ### Migration Strategy
-Use `new-write + lazy read-through migration + background queue`.
+Use `new-write + lazy read-through migration + hybrid queue/immediate sync`.
 
 Behavior:
 
 - All new writes go to Ceph only
 - Reads can be served from Swift only when Ceph returns exact `404`
-- When a read falls back to Swift successfully, schedule migration into Ceph
+- When a read falls back to Swift successfully, migrate into Ceph through the queue when trusted caller-token expiry metadata exists
+- When a fallback-triggered migration has caller auth but no trusted expiry metadata, start immediate best-effort migration with the caller token
 - Background jobs can also migrate containers or whole accounts proactively
 
 ### What Must Be Preserved
@@ -209,6 +214,12 @@ Background workers should:
 - Verify migrated object integrity with `ETag` where possible
 - Retry failed jobs with backoff
 - Persist job state in SQLite for v1
+
+Immediate request-triggered migration should:
+
+- Use the original caller token instead of worker credentials
+- Run only when the service cannot safely queue caller-token work because trusted expiry metadata is unavailable
+- Keep the client response path fast by doing migration work after the fallback response is ready
 
 ## Implementation Layout
 

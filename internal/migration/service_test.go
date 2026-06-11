@@ -178,6 +178,74 @@ func TestCopyObjectNowWithSourceAuthUsesCallerHeadersForTargetPut(t *testing.T) 
 	assertHeader(t, objectPut.Headers, "X-Object-Meta-Foo", "bar")
 }
 
+func TestSyncContainerNowWithSourceAuthCopiesObjectsImmediately(t *testing.T) {
+	t.Parallel()
+
+	containerPath := backend.BuildContainerPath("AUTH_demo", "images")
+	objectPath := backend.BuildObjectPath("AUTH_demo", "images", "a.qcow2")
+	containerHeaders := mapHeaders("X-Container-Read", ".r:*")
+	objectHeaders := mapHeaders("Content-Type", "application/octet-stream", "X-Object-Meta-Foo", "bar", "ETag", `"abc"`)
+	var cephRequests []backend.Request
+
+	ceph := backendFunc(func(_ context.Context, req backend.Request) (*http.Response, error) {
+		cephRequests = append(cephRequests, cloneRequest(req))
+		switch {
+		case req.Method == http.MethodPut && req.Path == containerPath:
+			return newHTTPResponse(http.StatusCreated, nil, "")
+		case req.Method == http.MethodPost && req.Path == containerPath:
+			return newHTTPResponse(http.StatusNoContent, nil, "")
+		case req.Method == http.MethodHead && req.Path == containerPath:
+			return newHTTPResponse(http.StatusNoContent, containerHeaders, "")
+		case req.Method == http.MethodPut && req.Path == objectPath:
+			return newHTTPResponse(http.StatusCreated, nil, "")
+		case req.Method == http.MethodHead && req.Path == objectPath:
+			return newHTTPResponse(http.StatusNoContent, objectHeaders, "")
+		default:
+			t.Fatalf("unexpected ceph request: %s %s", req.Method, req.Path)
+			return nil, nil
+		}
+	})
+
+	swift := backendFunc(func(_ context.Context, req backend.Request) (*http.Response, error) {
+		switch {
+		case req.Method == http.MethodHead && req.Path == containerPath:
+			return newHTTPResponse(http.StatusNoContent, containerHeaders, "")
+		case req.Method == http.MethodGet && req.Path == containerPath && req.Query.Get("format") == "json":
+			return newHTTPResponse(http.StatusOK, nil, `[{"name":"a.qcow2"}]`)
+		case req.Method == http.MethodHead && req.Path == objectPath:
+			return newHTTPResponse(http.StatusNoContent, objectHeaders, "")
+		case req.Method == http.MethodGet && req.Path == objectPath:
+			return newHTTPResponse(http.StatusOK, nil, "from-swift")
+		default:
+			t.Fatalf("unexpected swift request: %s %s", req.Method, req.Path)
+			return nil, nil
+		}
+	})
+
+	svc := &Service{
+		ceph:   ceph,
+		swift:  swift,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	err := svc.SyncContainerNowWithSourceAuth(context.Background(), "AUTH_demo", "images", auth.Credentials{
+		AuthToken:     "token-123",
+		Authorization: "Bearer token-123",
+	})
+	if err != nil {
+		t.Fatalf("sync container: %v", err)
+	}
+
+	if len(cephRequests) != 5 {
+		t.Fatalf("expected 5 ceph requests, got %d", len(cephRequests))
+	}
+	objectPut := cephRequests[3]
+	assertHeader(t, objectPut.Headers, "X-Auth-Token", "token-123")
+	assertHeader(t, objectPut.Headers, "Authorization", "Bearer token-123")
+	assertHeader(t, objectPut.Headers, "Content-Type", "application/octet-stream")
+	assertHeader(t, objectPut.Headers, "X-Object-Meta-Foo", "bar")
+}
+
 func mapHeaders(kv ...string) http.Header {
 	headers := make(http.Header)
 	for i := 0; i < len(kv); i += 2 {

@@ -20,8 +20,12 @@ type fakeMigrator struct {
 	mu              sync.Mutex
 	enqueuedObjects []string
 	enqueuedConts   []string
+	copiedObjects   []string
+	syncedConts     []string
 	lastObjectCreds auth.Credentials
 	lastContCreds   auth.Credentials
+	lastCopyCreds   auth.Credentials
+	lastSyncCreds   auth.Credentials
 }
 
 func (f *fakeMigrator) EnqueueObjectWithSourceAuth(_ context.Context, account, container, object string, creds auth.Credentials) (store.Job, error) {
@@ -44,7 +48,19 @@ func (f *fakeMigrator) EnsureContainerWithSourceAuth(_ context.Context, _, _ str
 	return true, nil
 }
 
-func (f *fakeMigrator) CopyObjectNowWithSourceAuth(_ context.Context, _, _, _ string, _ auth.Credentials) error {
+func (f *fakeMigrator) CopyObjectNowWithSourceAuth(_ context.Context, account, container, object string, creds auth.Credentials) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.copiedObjects = append(f.copiedObjects, account+"/"+container+"/"+object)
+	f.lastCopyCreds = creds
+	return nil
+}
+
+func (f *fakeMigrator) SyncContainerNowWithSourceAuth(_ context.Context, account, container string, creds auth.Credentials) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.syncedConts = append(f.syncedConts, account+"/"+container)
+	f.lastSyncCreds = creds
 	return nil
 }
 
@@ -152,6 +168,53 @@ func TestObjectReadSkipsQueuedMigrationWhenTokenExpiryMissing(t *testing.T) {
 	defer migrator.mu.Unlock()
 	if len(migrator.enqueuedObjects) != 0 {
 		t.Fatalf("expected migration enqueue to be skipped, got %#v", migrator.enqueuedObjects)
+	}
+	if len(migrator.copiedObjects) != 1 || migrator.copiedObjects[0] != "AUTH_demo/images/a.qcow2" {
+		t.Fatalf("expected immediate copy, got %#v", migrator.copiedObjects)
+	}
+	if migrator.lastCopyCreds.AuthToken != "token-123" || migrator.lastCopyCreds.ExpiresAt != nil {
+		t.Fatalf("expected caller credentials without expiry, got %#v", migrator.lastCopyCreds)
+	}
+}
+
+func TestContainerListingStartsImmediateSyncWhenTokenExpiryMissing(t *testing.T) {
+	t.Parallel()
+
+	migrator := &fakeMigrator{}
+	cephServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer cephServer.Close()
+
+	swiftServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"name":"a.qcow2"}]`))
+	}))
+	defer swiftServer.Close()
+
+	handler := newTestHandler(t, cephServer.URL+"/v1", swiftServer.URL+"/v1", migrator)
+	req := httptest.NewRequest(http.MethodGet, "/v1/AUTH_demo/images?format=json", nil)
+	req.Header.Set("X-Auth-Token", "token-123")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+	res := rec.Result()
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status: %d", res.StatusCode)
+	}
+
+	migrator.mu.Lock()
+	defer migrator.mu.Unlock()
+	if len(migrator.enqueuedConts) != 0 {
+		t.Fatalf("expected queued container scan to be skipped, got %#v", migrator.enqueuedConts)
+	}
+	if len(migrator.syncedConts) != 1 || migrator.syncedConts[0] != "AUTH_demo/images" {
+		t.Fatalf("expected immediate container sync, got %#v", migrator.syncedConts)
+	}
+	if migrator.lastSyncCreds.AuthToken != "token-123" || migrator.lastSyncCreds.ExpiresAt != nil {
+		t.Fatalf("expected caller credentials without expiry, got %#v", migrator.lastSyncCreds)
 	}
 }
 
@@ -346,7 +409,7 @@ func newTestHandler(t *testing.T, cephURL, swiftURL string, migrator *fakeMigrat
 		t.Fatalf("new swift backend: %v", err)
 	}
 
-	return NewHandler(
+	handler := NewHandler(
 		cephClient,
 		swiftClient,
 		migrator,
@@ -355,4 +418,8 @@ func newTestHandler(t *testing.T, cephURL, swiftURL string, migrator *fakeMigrat
 		true,
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 	)
+	handler.runAsync = func(fn func()) {
+		fn()
+	}
+	return handler
 }

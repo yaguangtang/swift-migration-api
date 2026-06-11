@@ -106,6 +106,32 @@ func (s *Service) EnsureContainer(ctx context.Context, account, container string
 	return s.EnsureContainerWithSourceAuth(ctx, account, container, auth.Credentials{})
 }
 
+func (s *Service) SyncContainerNowWithSourceAuth(ctx context.Context, account, container string, creds auth.Credentials) error {
+	headers, err := s.headersForCredentials(ctx, creds, false)
+	if err != nil {
+		return err
+	}
+
+	exists, err := s.EnsureContainerWithSourceAuth(ctx, account, container, creds)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+
+	return s.forEachSourceContainerObject(ctx, account, container, headers, func(name string) error {
+		if err := s.copyObjectNowWithHeaders(ctx, account, container, name, headers); err != nil {
+			if errors.Is(err, ErrNotFound) {
+				s.logger.Warn("skipping source object that disappeared during immediate container sync", "account", account, "container", container, "object", name)
+				return nil
+			}
+			return fmt.Errorf("copy source object %s: %w", name, err)
+		}
+		return nil
+	})
+}
+
 func (s *Service) EnsureContainerWithSourceAuth(ctx context.Context, account, container string, creds auth.Credentials) (bool, error) {
 	headers, err := s.headersForCredentials(ctx, creds, false)
 	if err != nil {
@@ -181,77 +207,7 @@ func (s *Service) CopyObjectNowWithSourceAuth(ctx context.Context, account, cont
 		return err
 	}
 
-	path := backend.BuildObjectPath(account, container, object)
-	sourceHead, err := s.swift.Do(ctx, backend.Request{
-		Method:  http.MethodHead,
-		Path:    path,
-		Headers: headers,
-	})
-	if err != nil {
-		return fmt.Errorf("head source object: %w", err)
-	}
-	defer sourceHead.Body.Close()
-
-	if sourceHead.StatusCode == http.StatusNotFound {
-		return ErrNotFound
-	}
-	if !backend.IsSuccess(sourceHead.StatusCode) {
-		return fmt.Errorf("head source object returned status %d", sourceHead.StatusCode)
-	}
-
-	sourceResp, err := s.swift.Do(ctx, backend.Request{
-		Method:  http.MethodGet,
-		Path:    path,
-		Headers: headers,
-	})
-	if err != nil {
-		return fmt.Errorf("get source object: %w", err)
-	}
-	defer sourceResp.Body.Close()
-
-	if sourceResp.StatusCode == http.StatusNotFound {
-		return ErrNotFound
-	}
-	if !backend.IsSuccess(sourceResp.StatusCode) {
-		return fmt.Errorf("get source object returned status %d", sourceResp.StatusCode)
-	}
-
-	objectHeaders := filterObjectHeaders(sourceHead.Header)
-	targetObjectHeaders := mergeHeaders(headers, objectHeaders)
-	putResp, err := s.ceph.Do(ctx, backend.Request{
-		Method:        http.MethodPut,
-		Path:          path,
-		Headers:       targetObjectHeaders,
-		Body:          sourceResp.Body,
-		ContentLength: sourceResp.ContentLength,
-	})
-	if err != nil {
-		return fmt.Errorf("put target object: %w", err)
-	}
-	defer putResp.Body.Close()
-
-	if !backend.IsSuccess(putResp.StatusCode) {
-		return fmt.Errorf("put target object returned status %d", putResp.StatusCode)
-	}
-
-	targetHead, err := s.ceph.Do(ctx, backend.Request{
-		Method:  http.MethodHead,
-		Path:    path,
-		Headers: headers,
-	})
-	if err != nil {
-		return fmt.Errorf("head target object after copy: %w", err)
-	}
-	defer targetHead.Body.Close()
-	if !backend.IsSuccess(targetHead.StatusCode) {
-		return fmt.Errorf("head target object returned status %d after copy", targetHead.StatusCode)
-	}
-
-	if err := s.verifyObjectCopy(sourceHead.Header, targetHead.Header); err != nil {
-		return err
-	}
-
-	return nil
+	return s.copyObjectNowWithHeaders(ctx, account, container, object, headers)
 }
 
 func (s *Service) enqueue(ctx context.Context, jobType store.JobType, account, container, object string, creds auth.Credentials) (store.Job, error) {
@@ -400,6 +356,89 @@ func (s *Service) processContainerJob(ctx context.Context, job store.Job) error 
 		return err
 	}
 
+	return s.forEachSourceContainerObject(ctx, job.Account, job.Container, headers, func(name string) error {
+		if _, err := s.EnqueueObjectWithSourceAuth(ctx, job.Account, job.Container, name, creds); err != nil {
+			s.logger.Error("failed to enqueue object copy", "account", job.Account, "container", job.Container, "object", name, "error", err)
+		}
+		return nil
+	})
+}
+
+func (s *Service) copyObjectNowWithHeaders(ctx context.Context, account, container, object string, headers http.Header) error {
+	path := backend.BuildObjectPath(account, container, object)
+	sourceHead, err := s.swift.Do(ctx, backend.Request{
+		Method:  http.MethodHead,
+		Path:    path,
+		Headers: headers,
+	})
+	if err != nil {
+		return fmt.Errorf("head source object: %w", err)
+	}
+	defer sourceHead.Body.Close()
+
+	if sourceHead.StatusCode == http.StatusNotFound {
+		return ErrNotFound
+	}
+	if !backend.IsSuccess(sourceHead.StatusCode) {
+		return fmt.Errorf("head source object returned status %d", sourceHead.StatusCode)
+	}
+
+	sourceResp, err := s.swift.Do(ctx, backend.Request{
+		Method:  http.MethodGet,
+		Path:    path,
+		Headers: headers,
+	})
+	if err != nil {
+		return fmt.Errorf("get source object: %w", err)
+	}
+	defer sourceResp.Body.Close()
+
+	if sourceResp.StatusCode == http.StatusNotFound {
+		return ErrNotFound
+	}
+	if !backend.IsSuccess(sourceResp.StatusCode) {
+		return fmt.Errorf("get source object returned status %d", sourceResp.StatusCode)
+	}
+
+	objectHeaders := filterObjectHeaders(sourceHead.Header)
+	targetObjectHeaders := mergeHeaders(headers, objectHeaders)
+	putResp, err := s.ceph.Do(ctx, backend.Request{
+		Method:        http.MethodPut,
+		Path:          path,
+		Headers:       targetObjectHeaders,
+		Body:          sourceResp.Body,
+		ContentLength: sourceResp.ContentLength,
+	})
+	if err != nil {
+		return fmt.Errorf("put target object: %w", err)
+	}
+	defer putResp.Body.Close()
+
+	if !backend.IsSuccess(putResp.StatusCode) {
+		return fmt.Errorf("put target object returned status %d", putResp.StatusCode)
+	}
+
+	targetHead, err := s.ceph.Do(ctx, backend.Request{
+		Method:  http.MethodHead,
+		Path:    path,
+		Headers: headers,
+	})
+	if err != nil {
+		return fmt.Errorf("head target object after copy: %w", err)
+	}
+	defer targetHead.Body.Close()
+	if !backend.IsSuccess(targetHead.StatusCode) {
+		return fmt.Errorf("head target object returned status %d after copy", targetHead.StatusCode)
+	}
+
+	if err := s.verifyObjectCopy(sourceHead.Header, targetHead.Header); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *Service) forEachSourceContainerObject(ctx context.Context, account, container string, headers http.Header, visit func(string) error) error {
 	marker := ""
 	for {
 		query := url.Values{
@@ -411,7 +450,7 @@ func (s *Service) processContainerJob(ctx context.Context, job store.Job) error 
 		}
 		resp, err := s.swift.Do(ctx, backend.Request{
 			Method:  http.MethodGet,
-			Path:    backend.BuildContainerPath(job.Account, job.Container),
+			Path:    backend.BuildContainerPath(account, container),
 			Query:   query,
 			Headers: headers,
 		})
@@ -432,8 +471,8 @@ func (s *Service) processContainerJob(ctx context.Context, job store.Job) error 
 			if name == "" {
 				continue
 			}
-			if _, err := s.EnqueueObjectWithSourceAuth(ctx, job.Account, job.Container, name, creds); err != nil {
-				s.logger.Error("failed to enqueue object copy", "account", job.Account, "container", job.Container, "object", name, "error", err)
+			if err := visit(name); err != nil {
+				return err
 			}
 			marker = name
 		}

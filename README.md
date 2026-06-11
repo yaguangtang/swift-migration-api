@@ -12,8 +12,9 @@ It gives clients a single Swift-compatible endpoint while data is being migrated
 - Tries Ceph RGW first for all Swift-style requests
 - Falls back to legacy Swift only when Ceph returns an exact `404 Not Found`
 - Streams fallback reads back to the client immediately
-- Enqueues background migration jobs so objects can be copied into Ceph after a fallback read
-- Uses the original caller token for lazy fallback migration when token expiry metadata is available
+- Enqueues background migration jobs when trusted caller-token expiry metadata is available
+- Starts immediate caller-token migration work when fallback migration lacks trusted expiry metadata
+- Uses the original caller token for fallback-triggered migration work
 - Rejects queued caller-token jobs when the token is already stale or too close to expiry
 - Preserves container metadata and ACL-related headers when recreating containers in Ceph
 - Supports YAML and JSON configuration files
@@ -34,7 +35,7 @@ It gives clients a single Swift-compatible endpoint while data is being migrated
                  |  - Swift-compatible front end    |
                  |  - Ceph-first request routing    |
                  |  - 404 fallback to old Swift     |
-                 |  - Background migration queue    |
+                 |  - Queue + immediate sync paths  |
                  +-----------+--------------+-------+
                              |              |
                   read/write |              | fallback read
@@ -48,7 +49,7 @@ It gives clients a single Swift-compatible endpoint while data is being migrated
                            |                     |
                            +----------+----------+
                                       |
-                                      | background copy
+                                      | queued or immediate copy
                                       | metadata + objects
                                       v
                             +----------------------+
@@ -62,8 +63,91 @@ It gives clients a single Swift-compatible endpoint while data is being migrated
 1. A client sends a Swift-compatible request to this service.
 2. The service sends the request to Ceph RGW first.
 3. If Ceph returns an exact `404`, the service retries against legacy Swift.
-4. If legacy Swift returns data successfully, the service serves the response and schedules migration work.
-5. New writes go to Ceph only.
+4. If legacy Swift returns data successfully, the service serves the response and starts migration work.
+5. If trusted caller-token expiry metadata is present, the service enqueues background migration work.
+6. If caller auth is present but expiry metadata is missing, the service starts immediate best-effort migration with the caller token.
+7. New writes go to Ceph only.
+
+## Request Processing Policy
+
+### Global Rule
+
+For every supported data-plane request:
+
+1. Send the request to Ceph RGW first.
+2. Only if Ceph returns exact `404`, try legacy Swift.
+3. If Swift also returns `404`, return `404`.
+4. If Ceph returns `401`, `403`, `409`, `5xx`, timeout, or any other non-404 failure, do not fall back to Swift.
+5. Return the Ceph result directly in those cases.
+
+### Account Listing
+
+For `GET /v1/{account}`:
+
+- Query both Ceph and Swift.
+- Merge listing results.
+- De-duplicate by container name.
+- Prefer the Ceph entry when the same container exists in both.
+
+### Container Listing
+
+For `GET /v1/{account}/{container}`:
+
+- Query both backends.
+- Merge and de-duplicate object names.
+- Prefer Ceph objects when duplicates exist.
+- When Swift contributes objects to the merged response, start migration for that container.
+- Enqueue the container migration job when trusted caller-token expiry metadata exists.
+- Start immediate best-effort container sync with the caller token when caller auth exists but expiry metadata is unavailable.
+
+### Container Create and Metadata Update
+
+For `PUT` and `POST /v1/{account}/{container}`:
+
+- Write only to Ceph.
+- If the container exists only in Swift, create it in Ceph first.
+- Copy container ACLs and metadata to Ceph.
+
+### Container Delete
+
+For `DELETE /v1/{account}/{container}`:
+
+- Check both backends for emptiness.
+- Return `409 Conflict` if either backend still has objects.
+- Delete from both when empty.
+- Return `404` only if the container does not exist in either backend.
+
+### Object Read
+
+For `GET` and `HEAD /v1/{account}/{container}/{object...}`:
+
+- Try Ceph first.
+- If Ceph returns `404`, read from Swift.
+- If Swift returns the object successfully, stream it back immediately.
+- Enqueue an asynchronous object migration job when trusted caller-token expiry metadata exists.
+- Start immediate best-effort object migration with the caller token when caller auth exists but expiry metadata is unavailable.
+
+### Object Create or Replace
+
+For `PUT /v1/{account}/{container}/{object...}`:
+
+- Write only to Ceph.
+- If the container exists only in Swift, recreate it in Ceph first with the same ACLs and metadata.
+
+### Object Metadata Update
+
+For `POST /v1/{account}/{container}/{object...}`:
+
+- Apply updates only to Ceph.
+- If the object exists only in Swift, copy it to Ceph first and then update metadata.
+
+### Object Delete
+
+For `DELETE /v1/{account}/{container}/{object...}`:
+
+- Attempt delete on both Ceph and Swift.
+- Return success if the object existed and was deleted from at least one backend.
+- Return `404` only if the object does not exist in either backend.
 
 ## Project Layout
 
@@ -100,7 +184,7 @@ Queued caller-token migrations require trusted token-expiry metadata on the inco
 - `X-Token-Expires-At`
 - `X-Authorization-Expires-At`
 
-If a fallback read includes user auth but no usable expiry header, the service will serve the read but skip enqueuing that caller-token migration job. If a queued caller-token job reaches the worker after the token is stale or too close to expiry, the job is marked as rejected instead of being replayed with the wrong identity.
+If a fallback read or merged container listing includes user auth but no usable expiry header, the service will still serve the client request. It will skip queueing that caller-token migration job and start immediate best-effort migration work with the caller token instead. If a queued caller-token job reaches the worker after the token is stale or too close to expiry, the job is marked as rejected instead of being replayed with the wrong identity.
 
 ## Local Development
 
