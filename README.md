@@ -116,10 +116,16 @@ Run the service:
 go run ./cmd/swift-migration-api -config ./config.example.yaml
 ```
 
-## CI
+## CI And Releases
 
 GitHub Actions is configured to run on every pull request and will:
 
 - Set up Go
 - Run `go test ./...`
 - Build the service binary from `./cmd/swift-migration-api`
+
+When you push a tag that starts with `v`, for example `v0.1.0`, the same workflow will also:
+
+- Build release archives for Linux and macOS on `amd64` and `arm64`
+- Generate SHA-256 checksum files for each archive
+- Publish those files to a GitHub Release for the tag

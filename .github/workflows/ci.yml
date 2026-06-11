@@ -2,6 +2,9 @@ name: CI
 
 on:
   pull_request:
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
 
 jobs:
@@ -23,3 +26,75 @@ jobs:
 
       - name: Build binary
         run: go build -v -o ./bin/swift-migration-api ./cmd/swift-migration-api
+
+  build-release-artifacts:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build release archive
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+          VERSION: ${{ github.ref_name }}
+        run: |
+          mkdir -p dist
+          BIN_DIR="dist/swift-migration-api_${VERSION}_${GOOS}_${GOARCH}"
+          ARCHIVE="${BIN_DIR}.tar.gz"
+
+          mkdir -p "${BIN_DIR}"
+          go build -trimpath -ldflags="-s -w" -o "${BIN_DIR}/swift-migration-api" ./cmd/swift-migration-api
+          tar -C dist -czf "${ARCHIVE}" "$(basename "${BIN_DIR}")"
+          shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          rm -rf "${BIN_DIR}"
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+
+  publish-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - test-and-build
+      - build-release-artifacts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
