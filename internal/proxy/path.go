@@ -24,12 +24,14 @@ type SwiftPath struct {
 }
 
 func ParseSwiftPath(rawPath string) (SwiftPath, error) {
-	if !strings.HasPrefix(rawPath, "/v1/") {
+	const apiPrefix = "/v1/"
+
+	idx := strings.Index(rawPath, apiPrefix)
+	if idx < 0 {
 		return SwiftPath{}, ErrInvalidSwiftPath
 	}
 
-	suffix := strings.TrimPrefix(rawPath, "/v1/")
-	suffix = strings.TrimPrefix(suffix, "/")
+	suffix := rawPath[idx+len(apiPrefix):]
 	suffix = normalizeListingPathSuffix(suffix)
 	if suffix == "" {
 		return SwiftPath{}, ErrInvalidSwiftPath
