@@ -131,10 +131,11 @@ func (s *Service) EnsureContainerWithSourceAuth(ctx context.Context, account, co
 	}
 
 	containerHeaders := filterContainerHeaders(sourceHead.Header)
+	targetContainerHeaders := mergeHeaders(headers, containerHeaders)
 	putResp, err := s.ceph.Do(ctx, backend.Request{
 		Method:  http.MethodPut,
 		Path:    path,
-		Headers: containerHeaders,
+		Headers: targetContainerHeaders,
 	})
 	if err != nil {
 		return false, fmt.Errorf("create target container: %w", err)
@@ -148,7 +149,7 @@ func (s *Service) EnsureContainerWithSourceAuth(ctx context.Context, account, co
 		postResp, err := s.ceph.Do(ctx, backend.Request{
 			Method:  http.MethodPost,
 			Path:    path,
-			Headers: containerHeaders,
+			Headers: targetContainerHeaders,
 		})
 		if err != nil {
 			return false, fmt.Errorf("sync target container metadata: %w", err)
@@ -216,10 +217,11 @@ func (s *Service) CopyObjectNowWithSourceAuth(ctx context.Context, account, cont
 	}
 
 	objectHeaders := filterObjectHeaders(sourceHead.Header)
+	targetObjectHeaders := mergeHeaders(headers, objectHeaders)
 	putResp, err := s.ceph.Do(ctx, backend.Request{
 		Method:        http.MethodPut,
 		Path:          path,
-		Headers:       objectHeaders,
+		Headers:       targetObjectHeaders,
 		Body:          sourceResp.Body,
 		ContentLength: sourceResp.ContentLength,
 	})
@@ -501,6 +503,20 @@ func copyIfPresent(out, in http.Header, key string) {
 	for _, value := range in.Values(key) {
 		out.Add(key, value)
 	}
+}
+
+func mergeHeaders(base, extra http.Header) http.Header {
+	if len(base) == 0 && len(extra) == 0 {
+		return nil
+	}
+
+	out := auth.CloneHeader(base)
+	for key, values := range extra {
+		for _, value := range values {
+			out.Add(key, value)
+		}
+	}
+	return out
 }
 
 func max(a, b int) int {
