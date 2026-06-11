@@ -30,6 +30,7 @@ func ParseSwiftPath(rawPath string) (SwiftPath, error) {
 
 	suffix := strings.TrimPrefix(rawPath, "/v1/")
 	suffix = strings.TrimPrefix(suffix, "/")
+	suffix = normalizeListingPathSuffix(suffix)
 	if suffix == "" {
 		return SwiftPath{}, ErrInvalidSwiftPath
 	}
@@ -67,4 +68,23 @@ func ParseSwiftPath(rawPath string) (SwiftPath, error) {
 			BackendPath: "/" + suffix,
 		}, nil
 	}
+}
+
+func normalizeListingPathSuffix(suffix string) string {
+	if !strings.HasSuffix(suffix, "/") {
+		return suffix
+	}
+
+	trimmed := strings.TrimSuffix(suffix, "/")
+	if trimmed == "" {
+		return suffix
+	}
+
+	// Accept `/v1/{account}/` and `/v1/{account}/{container}/` as their
+	// listing endpoints, while still preserving object names that end in `/`.
+	if strings.Count(trimmed, "/") <= 1 {
+		return trimmed
+	}
+
+	return suffix
 }

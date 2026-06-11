@@ -220,7 +220,7 @@ func (h *Handler) handleMergedListing(w http.ResponseWriter, r *http.Request, pa
 		return
 	}
 	if !backend.IsSuccess(swiftResp.StatusCode) {
-		writeUpstreamResponse(w, cephResp, false)
+		writeUpstreamResponse(w, swiftResp, false)
 		return
 	}
 

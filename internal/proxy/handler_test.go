@@ -191,6 +191,108 @@ func TestAccountListingMergesCephAndSwift(t *testing.T) {
 	}
 }
 
+func TestAccountListingReturnsSwiftErrorWhenCephIsMissing(t *testing.T) {
+	t.Parallel()
+
+	cephServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer cephServer.Close()
+
+	swiftServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "swift denied account listing", http.StatusForbidden)
+	}))
+	defer swiftServer.Close()
+
+	handler := newTestHandler(t, cephServer.URL+"/v1", swiftServer.URL+"/v1", &fakeMigrator{})
+	req := httptest.NewRequest(http.MethodGet, "/v1/AUTH_demo?format=json", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+	res := rec.Result()
+	defer res.Body.Close()
+
+	body, _ := io.ReadAll(res.Body)
+	if res.StatusCode != http.StatusForbidden {
+		t.Fatalf("unexpected status: %d", res.StatusCode)
+	}
+	if string(body) != "swift denied account listing\n" {
+		t.Fatalf("unexpected body: %q", string(body))
+	}
+}
+
+func TestAccountListingDoesNotHideSwiftFailureBehindPartialCephResult(t *testing.T) {
+	t.Parallel()
+
+	cephServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"name":"alpha"}]`))
+	}))
+	defer cephServer.Close()
+
+	swiftServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "swift listing failed", http.StatusBadGateway)
+	}))
+	defer swiftServer.Close()
+
+	handler := newTestHandler(t, cephServer.URL+"/v1", swiftServer.URL+"/v1", &fakeMigrator{})
+	req := httptest.NewRequest(http.MethodGet, "/v1/AUTH_demo?format=json", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+	res := rec.Result()
+	defer res.Body.Close()
+
+	body, _ := io.ReadAll(res.Body)
+	if res.StatusCode != http.StatusBadGateway {
+		t.Fatalf("unexpected status: %d", res.StatusCode)
+	}
+	if string(body) != "swift listing failed\n" {
+		t.Fatalf("unexpected body: %q", string(body))
+	}
+}
+
+func TestAccountListingWithTrailingSlashFallsBackToSwift(t *testing.T) {
+	t.Parallel()
+
+	cephServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/AUTH_demo" {
+			t.Fatalf("unexpected ceph path: %s", r.URL.Path)
+		}
+		http.NotFound(w, r)
+	}))
+	defer cephServer.Close()
+
+	swiftServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/AUTH_demo" {
+			t.Fatalf("unexpected swift path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"name":"legacy"}]`))
+	}))
+	defer swiftServer.Close()
+
+	handler := newTestHandler(t, cephServer.URL+"/v1", swiftServer.URL+"/v1", &fakeMigrator{})
+	req := httptest.NewRequest(http.MethodGet, "/v1/AUTH_demo/?format=json", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+	res := rec.Result()
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status: %d", res.StatusCode)
+	}
+
+	var items []map[string]any
+	if err := json.NewDecoder(res.Body).Decode(&items); err != nil {
+		t.Fatalf("decode fallback response: %v", err)
+	}
+	if len(items) != 1 || items[0]["name"] != "legacy" {
+		t.Fatalf("unexpected merged listing: %#v", items)
+	}
+}
+
 func newTestHandler(t *testing.T, cephURL, swiftURL string, migrator *fakeMigrator) *Handler {
 	t.Helper()
 

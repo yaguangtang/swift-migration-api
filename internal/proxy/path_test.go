@@ -17,14 +17,29 @@ func TestParseSwiftPath(t *testing.T) {
 			want: SwiftPath{Account: "AUTH_demo", Kind: ResourceAccount, BackendPath: "/AUTH_demo"},
 		},
 		{
+			name: "account trailing slash",
+			path: "/v1/AUTH_demo/",
+			want: SwiftPath{Account: "AUTH_demo", Kind: ResourceAccount, BackendPath: "/AUTH_demo"},
+		},
+		{
 			name: "container",
 			path: "/v1/AUTH_demo/images",
+			want: SwiftPath{Account: "AUTH_demo", Container: "images", Kind: ResourceContainer, BackendPath: "/AUTH_demo/images"},
+		},
+		{
+			name: "container trailing slash",
+			path: "/v1/AUTH_demo/images/",
 			want: SwiftPath{Account: "AUTH_demo", Container: "images", Kind: ResourceContainer, BackendPath: "/AUTH_demo/images"},
 		},
 		{
 			name: "object",
 			path: "/v1/AUTH_demo/images/ubuntu/latest.qcow2",
 			want: SwiftPath{Account: "AUTH_demo", Container: "images", Object: "ubuntu/latest.qcow2", Kind: ResourceObject, BackendPath: "/AUTH_demo/images/ubuntu/latest.qcow2"},
+		},
+		{
+			name: "object keeps trailing slash",
+			path: "/v1/AUTH_demo/images/folder/",
+			want: SwiftPath{Account: "AUTH_demo", Container: "images", Object: "folder/", Kind: ResourceObject, BackendPath: "/AUTH_demo/images/folder/"},
 		},
 		{
 			name:    "invalid prefix",
